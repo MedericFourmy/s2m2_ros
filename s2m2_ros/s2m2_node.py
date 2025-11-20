@@ -35,9 +35,17 @@ from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityExce
 
 
 
-def image_pad(img, factor):
+def image_pad(img: torch.Tensor, factor: int):
+    """
+    Pad img so that its dimensions are a multiple of `factor`.
+
+    img: torch.Tensor (B,C,H,W), img needing to be padded
+    factor: factor by which the new img dimensions should be divisible
+
+    Out: torch.Tensor (B,C,H_new,W_new), padded image with H_new and W_new divisible by factor 
+    """
     with torch.no_grad():
-        H,W = img.shape[-2:]
+        H, W = img.shape[-2:]
 
         H_new = math.ceil(H / factor) * factor
         W_new = math.ceil(W / factor) * factor
@@ -69,10 +77,12 @@ def image_pad(img, factor):
 
         return img_pad
 
-def image_crop(img, img_shape):
+def image_crop(img: torch.Tensor, H_new: int, W_new: int) -> torch.Tensor:
+    """
+    Center crop the image to a new dimension
+    """
     with torch.no_grad():
-        H,W = img.shape[-2:]
-        H_new, W_new = img_shape
+        H, W = img.shape[-2:]
 
         crop_h = H - H_new
         if crop_h > 0:
@@ -91,7 +101,7 @@ def image_crop(img, img_shape):
 
 def depth_to_pointcloud(depth: np.ndarray, fx: float, fy: float, cx: float, cy: float):
     """
-    depth_mm: (H, W) depth in *meters*
+    depth_mm: (H, W) depth in meters
     returns Nx3 float32 array (X,Y,Z) in meters
     """
     h, w = depth.shape
@@ -194,7 +204,7 @@ class S2m2Node(Node):
 
         dt_disp = time.perf_counter() - t1
 
-        # convert to uint6, mm scaled, numpy depth map (e.g. like realsense depth topics)
+        # convert to uint16, mm scaled, numpy depth map (e.g. like realsense depth topics)
         depth_np = depth.squeeze(0).cpu().numpy()
         depth_mm_uint16 = (depth_np*1000).astype(np.uint16)
 
@@ -244,7 +254,7 @@ class S2m2Node(Node):
         left_torch = (torch.from_numpy(left).permute(-1, 0, 1).unsqueeze(0)).half().to(self.device)  # (H,W,3) f32 -> (1,3,H,W) f16
         right_torch = (torch.from_numpy(right).permute(-1, 0, 1).unsqueeze(0)).half().to(self.device)  # (H,W,3) f32 -> (1,3,H,W) f16
 
-        # pad images with smooth padding
+        # s2m2 model requires img dimensions divisible by 32 -> smooth pad the imgs
         left_torch_pad = image_pad(left_torch, 32)
         right_torch_pad = image_pad(right_torch, 32)
 
@@ -255,9 +265,9 @@ class S2m2Node(Node):
 
         # Remove padding
         img_height, img_width = left.shape[:2]
-        pred_disp = image_crop(pred_disp, (img_height, img_width))
-        # pred_occ = image_crop(pred_occ, (img_height, img_width))
-        # pred_conf = image_crop(pred_conf, (img_height, img_width))
+        pred_disp = image_crop(pred_disp, img_height, img_width)
+        # pred_occ = image_crop(pred_occ, img_height, img_width)
+        # pred_conf = image_crop(pred_conf, img_height, img_width)
 
         return pred_disp.squeeze(0).squeeze(0)  # (H,W)
 
