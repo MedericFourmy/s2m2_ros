@@ -10,7 +10,6 @@ import cv2
 import torch
 import torch.nn.functional as F
 import numpy as np
-import open3d as o3d
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from s2m2.s2m2 import load_model
@@ -29,8 +28,10 @@ import rclpy
 from rclpy.node import Node
 from cv_bridge import CvBridge
 
-from sensor_msgs.msg import CameraInfo, Image
 from message_filters import Subscriber, ApproximateTimeSynchronizer
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+import sensor_msgs_py.point_cloud2 as pc2
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 
 
 
@@ -86,7 +87,27 @@ def image_crop(img, img_shape):
             img = img[:,:,:, crop_s: -crop_e]
 
         return img
-    
+
+
+def depth_to_pointcloud(depth: np.ndarray, fx: float, fy: float, cx: float, cy: float):
+    """
+    depth_mm: (H, W) depth in *meters*
+    returns Nx3 float32 array (X,Y,Z) in meters
+    """
+    h, w = depth.shape
+
+    # pixel coordinate grid
+    xs, ys = np.meshgrid(np.arange(w), np.arange(h))
+
+    # back project into 3D
+    X = (xs - cx) * depth / fx
+    Y = (ys - cy) * depth / fy
+
+    # flatten
+    points = np.stack((X, Y, depth), axis=-1).reshape(-1, 3)
+    return points
+
+
 
 class S2m2Node(Node):
     def __init__(self):
@@ -95,7 +116,6 @@ class S2m2Node(Node):
         # -----------------------------
         # Subscribers (message_filters)
         # -----------------------------
-        print("Load s2m2 model")
         model_type = "S"  # select model type: S,M,L,XL
         allow_negative = False  # TODO: figure out what this is
         num_refine = 3
@@ -107,6 +127,7 @@ class S2m2Node(Node):
             num_refine,
         ).to(self.device).eval()
         # self.model_s2m2 = torch.compile(self.model_s2m2)
+        self.get_logger().info(f"Loaded s2m2 model '{model_type}' on device {self.device}")
 
         self.bridge = CvBridge()
 
@@ -122,6 +143,10 @@ class S2m2Node(Node):
         self.infra2_img_sub = Subscriber(self, Image, topic_right_image_rect)
         self.infra2_info_sub = Subscriber(self, CameraInfo, topic_right_info)
 
+        # tf needed to get the baseline
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         # -----------------------------
         # Approximate Time Sync
         # -----------------------------
@@ -134,8 +159,80 @@ class S2m2Node(Node):
         # -----------------------------
         topic_depth_info = '/camera/camera/depth_s2m2/camera_info'
         topic_depth_image = '/camera/camera/depth_s2m2/depth'
-        self.depth_info_pub = self.create_publisher(CameraInfo, topic_depth_info, 10)
-        self.depth_pub = self.create_publisher(Image, topic_depth_image, 10)
+        self.depth_info_pub = self.create_publisher(CameraInfo, topic_depth_info, 1)
+        self.depth_pub = self.create_publisher(Image, topic_depth_image, 1)
+
+        topic_s2m2_points = '/camera/camera/depth_s2m2/points'
+        self.pc_pub = self.create_publisher(PointCloud2, topic_s2m2_points, 1)
+
+    def sync_callback(self,
+                  left_img_msg: Image,
+                  left_info_msg: CameraInfo,
+                  right_img_msg: Image,
+                  right_info_msg: CameraInfo):
+        assert np.allclose(left_info_msg.k, right_info_msg.k), "Left and right images should have identical intrinsics"
+
+        left_frame = left_img_msg.header.frame_id
+        right_frame = right_img_msg.header.frame_id
+
+        baseline = self.get_stereo_baseline(left_frame, right_frame)
+        if baseline is None:
+            self.get_logger().warn("Baseline unavailable — skipping this frame")
+            return
+
+        try:
+            cv_infra1 = self.bridge.imgmsg_to_cv2(left_img_msg, desired_encoding='mono8')
+            cv_infra2 = self.bridge.imgmsg_to_cv2(right_img_msg, desired_encoding='mono8')
+        except Exception as e:
+            self.get_logger().error(f"cv_bridge conversion failed: {e}")
+            return
+
+        t1 = time.perf_counter()
+        disp = self.get_disparity_map(cv_infra1, cv_infra2)
+        fx = left_info_msg.k[0]
+        depth = baseline * fx / disp 
+
+        dt_disp = time.perf_counter() - t1
+
+        # convert to uint6, mm scaled, numpy depth map (e.g. like realsense depth topics)
+        depth_np = depth.squeeze(0).cpu().numpy()
+        depth_mm_uint16 = (depth_np*1000).astype(np.uint16)
+
+        dt_depth = time.perf_counter() - t1
+        dt_conv = dt_depth - dt_disp
+
+        self.get_logger().info(f"dt_disp [ms]: {1e3*dt_disp}")
+        self.get_logger().info(f"dt_conv [ms]: {1e3*dt_conv}")
+        self.get_logger().info(f"dt_depth [ms]: {1e3*dt_depth}")
+
+        # Convert depth to ROS Image
+        depth_msg = self.bridge.cv2_to_imgmsg(depth_mm_uint16, encoding='16UC1')
+        depth_msg.header = left_img_msg.header  # time + frame sync
+        depth_info = left_info_msg  # depth image intrinsics is identical to the left image
+
+        # ---------------------------------------------------------
+        # Publish messages
+        # ---------------------------------------------------------
+        self.depth_info_pub.publish(depth_info)
+        self.depth_pub.publish(depth_msg)
+
+        self.get_logger().info("Published depth_s2m2 camera_info + depth")
+
+        # Publish PointCloud2
+        # -----------------------------------------
+        k = left_info_msg.k  # stored in row-major order
+        fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+        points = depth_to_pointcloud(depth_np, fx, fy, cx, cy)
+
+        # Remove invalid points (inf or NaN or zero depth)
+        valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 0)
+        points = points[valid]
+
+        # Create and publish PointCloud2 message
+        pc_msg = pc2.create_cloud_xyz32(left_img_msg.header, points)
+        self.pc_pub.publish(pc_msg)
+
+        self.get_logger().info("Published depth_s2m2 point cloud")
 
     def get_disparity_map(self, left: np.ndarray, right: np.ndarray):
         # convert to RGB
@@ -164,51 +261,29 @@ class S2m2Node(Node):
 
         return pred_disp.squeeze(0).squeeze(0)  # (H,W)
 
-    def sync_callback(self,
-                  left_img_msg: Image,
-                  left_info_msg: CameraInfo,
-                  right_img_msg: Image,
-                  right_info_msg: CameraInfo):
-        assert np.allclose(left_info_msg.k, right_info_msg.k), "Left and right images should have identical intrinsics"
-
+    def get_stereo_baseline(self, left_frame: str, right_frame: str) -> float:
+        """
+        Returns the baseline (meters) as the absolute translation along x
+        between left and right camera frames.
+        """
         try:
-            cv_infra1 = self.bridge.imgmsg_to_cv2(left_img_msg, desired_encoding='mono8')
-            cv_infra2 = self.bridge.imgmsg_to_cv2(right_img_msg, desired_encoding='mono8')
-        except Exception as e:
-            self.get_logger().error(f"cv_bridge conversion failed: {e}")
-            return
+            # lookup the transform from left → right
+            tf = self.tf_buffer.lookup_transform(
+                target_frame=left_frame,
+                source_frame=right_frame,
+                time=rclpy.time.Time(),    # latest available
+                timeout=rclpy.duration.Duration(seconds=0.2)
+            )
+            baseline = abs(tf.transform.translation.x)
+            self.get_logger().info(
+                f"TF stereo baseline between {left_frame} and {right_frame} = {baseline:.6f} m"
+            )
 
-        t1 = time.perf_counter()
-        disp = self.get_disparity_map(cv_infra1, cv_infra2)
-        fx = left_info_msg.k[0]
-        baseline = 0.014711925759911537  # TODO: get from /camera/camera/extrinsics/depth_to_color or read from config
-        depth = baseline * fx / disp
+            return baseline
 
-        dt_disp = time.perf_counter() - t1
-
-        # convert to uint6, mm scaled, numpy depth map (e.g. like realsense depth topics)
-        depth_np_mm = (depth*1000).squeeze(0).cpu().numpy()
-        depth_mm_uint16 = depth_np_mm.astype(np.uint16)
-
-        dt_depth = time.perf_counter() - t1
-        dt_conv = dt_depth - dt_disp
-
-        self.get_logger().info(f"dt_disp [ms]: {1e3*dt_disp}")
-        self.get_logger().info(f"dt_conv [ms]: {1e3*dt_conv}")
-        self.get_logger().info(f"dt_depth [ms]: {1e3*dt_depth}")
-
-        # Convert depth to ROS Image
-        depth_msg = self.bridge.cv2_to_imgmsg(depth_mm_uint16, encoding='16UC1')
-        depth_msg.header = left_img_msg.header  # time + frame sync
-        depth_info = left_info_msg  # depth image intrinsics is identical to the left image
-
-        # ---------------------------------------------------------
-        # Publish messages
-        # ---------------------------------------------------------
-        self.depth_info_pub.publish(depth_info)
-        self.depth_pub.publish(depth_msg)
-
-        self.get_logger().info("Published depth_s2m2 camera_info + depth")
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(f"Failed to lookup transform {left_frame} → {right_frame}: {e}")
+            return None
 
 def main(args=None):
     rclpy.init(args=args)
