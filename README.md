@@ -1,0 +1,8 @@
+# S2M2 ROS
+A ROS node for [s2m2](https://github.com/junhong-3dv/s2m2) stereo depth model.
+
+## Run node
+`ros2 run s2m2_ros s2m2_node`
+
+## Realsense Demo
+`ros2 launch realsense2_camera rs_launch.py --enable_infra1 --enable_infra2`
