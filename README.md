@@ -6,3 +6,9 @@ A ROS node for [s2m2](https://github.com/junhong-3dv/s2m2) stereo depth model.
 
 ## Realsense Demo
 `ros2 launch realsense2_camera rs_launch.py --enable_infra1 --enable_infra2`
+Higher resolution:  
+`ros2 launch realsense2_camera rs_launch.py enable_infra1:=true enable_infra2:=true pointcloud.enable:=true rgb_camera.color_profile:=1280x720x6 depth_module.depth_profile:=1280x720x6 depth_module.infra_profile:=1280x720x6`
+
+## TODO
+- launch file + config
+- rviz config for demo
