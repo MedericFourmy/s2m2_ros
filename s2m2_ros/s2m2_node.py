@@ -94,12 +94,11 @@ def depth_to_pointcloud(depth: np.ndarray, fx: float, fy: float, cx: float, cy: 
     # pixel coordinate grid
     xs, ys = np.meshgrid(np.arange(w), np.arange(h))
 
-    # back project into 3D
-    X = (xs - cx) * depth / fx
-    Y = (ys - cy) * depth / fy
-
-    # flatten
-    points = np.stack((X, Y, depth), axis=-1).reshape(-1, 3)
+    # back project to 3D points
+    points = np.zeros((depth.shape[0], depth.shape[1], 3), dtype=depth.dtype)
+    points[:,:,0] = (xs - cx) * depth / fx  # X
+    points[:,:,1] = (ys - cy) * depth / fy  # Y
+    points[:,:,2] = depth  # Z
     return points
 
 
@@ -171,7 +170,7 @@ class S2m2Node(Node):
         assert np.allclose(left_info_msg.k, right_info_msg.k), "Left and right images should have identical intrinsics"
 
         if self.pc_pub.get_subscription_count() == 0 and self.depth_pub.get_subscription_count() == 0:
-            self.get_logger().warn("No subscriber, return")
+            self.get_logger().warn("No subscriber to depth or pointcloud topics, return")
             return
 
         left_frame = left_img_msg.header.frame_id
@@ -190,50 +189,47 @@ class S2m2Node(Node):
             return
 
         t1 = time.perf_counter()
-        disp = self.get_disparity_map(cv_infra1, cv_infra2)
+        disp = self.get_disparity_map(cv_infra1, cv_infra2)  # (H,W), f32
         fx = left_info_msg.k[0]
         depth = baseline * fx / disp 
-        depth_np = depth.squeeze(0).cpu().numpy()
-
-        # print some timings
         self.get_logger().info(f"dt_depth [ms]: {1e3*(time.perf_counter() - t1)}")
 
         # Convert to uint16, mm scaled, numpy depth map (e.g. like realsense depth topics)
         # Then convert to ROS Image msg
-        depth_mm_uint16 = (depth_np*1000).astype(np.uint16)
+        t1 = time.perf_counter()
+        depth_mm_uint16 = (1000*depth).to(torch.uint16).cpu().numpy()
         depth_msg = self.bridge.cv2_to_imgmsg(depth_mm_uint16, encoding='16UC1')
         depth_msg.header = left_img_msg.header  # time + frame sync
         depth_info = left_info_msg  # depth image intrinsics is identical to the left image
+        self.get_logger().info(f"Convert and pub depth [ms]: {1e3*(time.perf_counter() - t1)}")
 
-        # ---------------------------------------------------------
+        # ----------------------------------------
         # Publish depth messages
-        # ---------------------------------------------------------
+        # ----------------------------------------
         self.depth_info_pub.publish(depth_info)
         self.depth_pub.publish(depth_msg)
         self.get_logger().info("Published depth_s2m2 camera_info + depth")
 
+        # -----------------------------------------
+        # Publish PointCloud2
+        # -----------------------------------------
         if self.pc_pub.get_subscription_count() == 0:
             self.get_logger().warn(f"No {self.topic_s2m2_points}, return")
             return
-
         t1 = time.perf_counter()
-        # Publish PointCloud2
-        # -----------------------------------------
         k = left_info_msg.k  # stored in row-major order
         fx, fy, cx, cy = k[0], k[4], k[2], k[5]
-        points = depth_to_pointcloud(depth_np, fx, fy, cx, cy)
+        points = depth_to_pointcloud(depth.cpu().numpy(), fx, fy, cx, cy)
 
         # Remove invalid points (inf or NaN or zero depth)
+        points = points.reshape(-1,3)
         valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 0)
         points = points[valid]
 
         # Create and publish PointCloud2 message
         pc_msg = pc2.create_cloud_xyz32(left_img_msg.header, points)
-        # self.get_logger().info(f"dt after create_cloud_xyz32 [ms]: {1e3*(time.perf_counter() -t1)}")
         self.pc_pub.publish(pc_msg)
         self.get_logger().info(f"dt after publish(pc_msg) [ms]: {1e3*(time.perf_counter() -t1)}")
-
-        self.get_logger().info("Published depth_s2m2 point cloud")
 
     def get_disparity_map(self, left: np.ndarray, right: np.ndarray):
         # convert to RGB
@@ -249,7 +245,7 @@ class S2m2Node(Node):
         left_torch_pad = image_pad(left_torch, 32)  # (1,3,H,W) -> (1,3,H_new,W_new)
         right_torch_pad = image_pad(right_torch, 32)  # (1,3,H,W) -> (1,3,H_new,W_new)
 
-        # predict disparity map
+        # predict disparity map in half precision
         with torch.no_grad():
             with torch.amp.autocast(enabled=True, device_type=self.device, dtype=torch.float16):
                 pred_disp, pred_occ, pred_conf = self.model_s2m2(left_torch_pad, right_torch_pad)  # (1,1,H,W)
@@ -276,10 +272,6 @@ class S2m2Node(Node):
                 timeout=rclpy.duration.Duration(seconds=0.2)
             )
             baseline = abs(tf.transform.translation.x)
-            self.get_logger().info(
-                f"TF stereo baseline between {left_frame} and {right_frame} = {baseline:.6f} m"
-            )
-
             return baseline
 
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
