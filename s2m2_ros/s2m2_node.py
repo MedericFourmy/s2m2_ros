@@ -114,12 +114,20 @@ class S2m2Node(Node):
         allow_negative = False  # TODO: figure out what this is
         num_refine = 3
         self.device = "cuda"
+        # most of the compilation time happens 
+        # when the model is first called, which can take > 10s
+        # then, each call is 3-5x faster than non compiled version
+        # TODO: explore disk caching options
+        torch_compile = False 
         self.model_s2m2 = load_model(
             S2M2_PRETRAINED_WEIGHTS_PATH,
             model_type,
             allow_negative,
             num_refine,
         ).to(self.device).eval()
+        if torch_compile:
+            self.get_logger().info(f"Compiling s2m2 model...")
+            self.model_s2m2.compile()
         # self.model_s2m2 = torch.compile(self.model_s2m2)
         self.get_logger().info(f"Loaded s2m2 model '{model_type}' on device {self.device}")
 
